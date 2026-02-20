@@ -118,7 +118,9 @@ async def generate_summary(pr_info: dict) -> str:
     """Copilot SDKを使ってPRの要約を生成する。"""
     prompt = build_prompt(pr_info)
 
-    async with CopilotClient() as client:
+    client = CopilotClient()
+    await client.start()
+    try:
         session = await client.create_session(
             {
                 "model": "gpt-4.1",
@@ -133,6 +135,8 @@ async def generate_summary(pr_info: dict) -> str:
 
         response = await session.send_and_wait({"prompt": prompt}, timeout=120.0)
         await session.destroy()
+    finally:
+        await client.stop()
 
     return response.data.content
 

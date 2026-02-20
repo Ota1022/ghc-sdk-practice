@@ -184,7 +184,9 @@ async def generate_multi_review(pr_info: dict) -> str:
     """メイン処理: fan-out → fan-in でマルチレビューを実行する。"""
     prompt = build_review_prompt(pr_info)
 
-    async with CopilotClient() as client:
+    client = CopilotClient()
+    await client.start()
+    try:
         # Fan-out: 3つのレビュアーを並列実行
         results = await asyncio.gather(
             run_reviewer(client, "security", REVIEWERS["security"], prompt),
@@ -200,6 +202,8 @@ async def generate_multi_review(pr_info: dict) -> str:
 
         # Fan-in: オーケストレーターが結果を統合
         return await run_orchestrator(client, reviews)
+    finally:
+        await client.stop()
 
 
 def post_review_comment(gh: Github, repo_name: str, pr_number: int, body: str) -> None:
