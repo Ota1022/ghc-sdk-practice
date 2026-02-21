@@ -105,8 +105,9 @@ from copilot import CopilotClient
 
 
 async def main():
-    # CopilotClient は async with で使う（起動→終了を自動管理）
-    async with CopilotClient() as client:
+    client = CopilotClient()
+    await client.start()
+    try:
         # セッションを作成（モデルを指定）
         session = await client.create_session({"model": "gpt-4.1"})
 
@@ -119,6 +120,8 @@ async def main():
 
         # セッションを破棄
         await session.destroy()
+    finally:
+        await client.stop()
 
 
 asyncio.run(main())
@@ -135,12 +138,16 @@ FizzBuzz のコードが返ってくれば環境構築は完了です。エラ�
 ```
 CopilotClient 作成 → start() → create_session() → send_and_wait() → destroy() → stop()
                      ^^^^^^^^                                                       ^^^^^^
-                  async with なら自動で呼ばれる
+                  明示的に呼ぶ必要がある（v0.1.0 は async with 未対応）
 ```
 
-- **CopilotClient**: Copilot CLI プロセスの起動・管理を行う。`async with` で使えば起動・停止は自動。
+- **CopilotClient**: Copilot CLI プロセスの起動・管理を行う。`start()` / `stop()` を `try-finally` で明示的に呼ぶ。
 - **Session**: 1つの会話スレッド。モデルやシステムメッセージの設定はここで行う。
 - **send_and_wait()**: メッセージを送り、LLM の応答が完了するまで待つ。最もシンプルな呼び方。
+
+> **Note: `async with` について**
+> SDK の `client.py` docstring には `async with CopilotClient() as client:` の使用例が記載されていますが、v0.1.0 では `__aenter__` / `__aexit__` が未実装のため動作しません（`TypeError` になります）。
+> `async with` サポートは [issue #341](https://github.com/github/copilot-sdk/issues/341) で要望が上がっており、[PR #475](https://github.com/github/copilot-sdk/pull/475) で実装済みです。次バージョン以降でリリースされる予定のため、それまでは上記の `start()` / `stop()` パターンを使ってください。
 
 ---
 
@@ -254,6 +261,120 @@ def post_comment(gh: Github, repo_name: str, pr_number: int, body: str) -> None:
 ---
 
 ## 6. ローカルで実行してみる
+
+### テスト用 PR を作成する
+
+bot を試すには、コメントを投稿できる PR が必要です。diff が複雑なほど要約の品質を確認しやすいため、複数ファイル・複数コミットで構成します。
+
+```bash
+# テスト用リポジトリを作成
+gh repo create pr-bot-test --public --clone
+cd pr-bot-test
+
+# ベースとなるファイル群を main に追加
+cat > auth.py << 'EOF'
+def login(username, password):
+    if username == "admin" and password == "password":
+        return True
+    return False
+EOF
+
+cat > db.py << 'EOF'
+import sqlite3
+
+def get_user(user_id):
+    conn = sqlite3.connect("app.db")
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
+    return cursor.fetchone()
+EOF
+
+git add . && git commit -m "Initial commit: add auth and db modules"
+git push -u origin main
+
+# 変更用ブランチを作成
+git checkout -b feat/improve-auth-and-db
+
+# コミット1: 認証ロジックをハッシュ化 + バリデーション追加
+cat > auth.py << 'EOF'
+import hashlib
+import re
+
+MIN_PASSWORD_LENGTH = 8
+
+def _hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def validate_password(password: str) -> bool:
+    """パスワードポリシーのバリデーション"""
+    if len(password) < MIN_PASSWORD_LENGTH:
+        return False
+    if not re.search(r"[A-Z]", password):
+        return False
+    if not re.search(r"[0-9]", password):
+        return False
+    return True
+
+def login(username: str, password: str, users_db: dict) -> bool:
+    if not username or not validate_password(password):
+        return False
+    hashed = _hash_password(password)
+    return users_db.get(username) == hashed
+EOF
+
+git add auth.py && git commit -m "feat: replace plaintext password check with SHA-256 hashing"
+
+# コミット2: SQLインジェクション修正 + コネクション管理改善
+cat > db.py << 'EOF'
+import sqlite3
+from contextlib import contextmanager
+
+DATABASE = "app.db"
+
+@contextmanager
+def get_connection():
+    conn = sqlite3.connect(DATABASE)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+def get_user(user_id: int) -> dict | None:
+    """SQLインジェクション対策済みのユーザー取得"""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+def get_users_by_role(role: str) -> list[dict]:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, role FROM users WHERE role = ?", (role,))
+        return [dict(row) for row in cursor.fetchall()]
+EOF
+
+git add db.py && git commit -m "fix: prevent SQL injection and improve connection management"
+
+# PR を作成
+git push -u origin feat/improve-auth-and-db
+gh pr create \
+  --title "fix: improve auth security and fix SQL injection vulnerability" \
+  --body "## 概要
+認証モジュールのセキュリティ改善と、SQLインジェクション脆弱性の修正。
+
+## 変更内容
+- パスワードを平文比較から SHA-256 ハッシュ比較に変更
+- パスワードポリシーのバリデーション追加（8文字以上、大文字・数字を含む）
+- SQL文の動的生成をプレースホルダーに置換
+- DB接続をコンテキストマネージャで管理するよう整理" \
+  --base main
+```
+
+PR が作成されると末尾に URL が表示されます。番号（例: `1`）を次のステップで使います。
+
+---
 
 実際に動かしてみましょう。対象にしたい PR が存在するリポジトリと PR 番号を用意してください。
 
